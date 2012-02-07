@@ -48,7 +48,7 @@ The ssl=on must be set in postgresql.conf
 
 The following command creates the databases and installs the sslinfo module.
 
-for db in hostssldb hostnossldb certdb hostsslcertdb; do
+for db in hostdb hostssldb hostnossldb certdb hostsslcertdb; do
   createdb $db
   psql $db -c "create extension sslinfo"
 done

@@ -66,6 +66,9 @@ create a file named $JDBC_SRC/build.local.properties and add your
 customized values of the properties "database", "username" and
 "password".
 
+To run SSL tests you need additional configuration, which is described
+in $JDBC_SRC/certdir/README.
+
 4 Running the test suite
 ------------------------
 %cd $JDBC_SRC
