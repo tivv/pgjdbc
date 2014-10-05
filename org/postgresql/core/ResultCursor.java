@@ -8,6 +8,8 @@
 */
 package org.postgresql.core;
 
+import org.postgresql.util.PSQLException;
+
 /**
  * Abstraction of a cursor over a returned resultset.
  * This is an opaque interface that only provides a way
@@ -22,5 +24,5 @@ public interface ResultCursor {
      * but may make it happen more promptly. Closed cursors should not be
      * passed to QueryExecutor methods.
      */
-    void close();
+    void close() throws PSQLException;
 }

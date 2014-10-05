@@ -101,6 +101,11 @@ public interface QueryExecutor {
     static int QUERY_NO_BINARY_TRANSFER = 256;
 
     /**
+     * Flag for query execution that some rows fetching can be postponed
+     */
+    static int QUERY_POSTPONED_FETCH = 512;
+
+    /**
      * Execute a Query, passing results to a provided ResultHandler.
      *
      * @param query the query to execute; must be a query returned from

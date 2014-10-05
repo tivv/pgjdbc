@@ -517,8 +517,10 @@ public abstract class AbstractJdbc2Statement implements BaseStatement
         closeForNextExecution();
 
         // Enable cursor-based resultset if possible.
-        if (fetchSize > 0 && !wantsScrollableResultSet() && !connection.getAutoCommit() && !wantsHoldableResultSet())
-            flags |= QueryExecutor.QUERY_FORWARD_CURSOR;
+        if (fetchSize > 0 && !wantsScrollableResultSet() && !wantsHoldableResultSet()) {
+            flags |= !connection.getAutoCommit() ? QueryExecutor.QUERY_FORWARD_CURSOR
+                    : QueryExecutor.QUERY_POSTPONED_FETCH;
+        }
 
         if (wantsGeneratedKeysOnce || wantsGeneratedKeysAlways)
         {
