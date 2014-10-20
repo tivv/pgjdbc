@@ -18,7 +18,7 @@ import org.postgresql.test.TestUtil;
  */
 public class CursorFetchTest extends TestCase
 {
-    private Connection con;
+    protected Connection con;
 
     public CursorFetchTest(String name)
     {

@@ -10,6 +10,7 @@ package org.postgresql.core;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 
 /**
  * A faster version of BufferedInputStream. Does no synchronisation and
@@ -297,5 +298,21 @@ public class VisibleBufferedInputStream extends InputStream {
             }
             pos = index;
         }
+    }
+
+    /**
+     * Tries to copy up to size bytes to given OutputStream as efficient as possible.
+     * @param copyToStream stream to copy to
+     * @param size how many bytes to copy
+     * @return how many bytes was copied or -1 if end of stream reached
+     * @throws IOException If reading of stream fails.
+     */
+    public int copyTo(OutputStream copyToStream, int size) throws IOException {
+        if (!ensureBytes(1))
+            return -1;
+        int toCopy = Math.min(size, endIndex - index);
+        copyToStream.write(buffer, index, toCopy);
+        index += toCopy;
+        return toCopy;
     }
 }

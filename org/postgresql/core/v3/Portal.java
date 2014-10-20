@@ -9,6 +9,11 @@
 package org.postgresql.core.v3;
 
 import java.lang.ref.PhantomReference;
+import java.sql.SQLException;
+import java.sql.SQLWarning;
+import java.util.ArrayList;
+import java.util.List;
+
 import org.postgresql.core.*;
 
 /**
@@ -18,7 +23,7 @@ import org.postgresql.core.*;
  *
  * @author Oliver Jowett (oliver@opencloud.com)
  */
-class Portal implements ResultCursor {
+class Portal implements FetchableResultCursor {
     Portal(SimpleQuery query, String portalName) {
         this.query = query;
         this.portalName = portalName;
@@ -32,6 +37,42 @@ class Portal implements ResultCursor {
             cleanupRef.enqueue();
             cleanupRef = null;
         }
+    }
+
+    @Override
+    public void fetch(QueryExecutor queryExecutor, ResultHandler handler, int fetchSize) throws SQLException {
+        // Insert a ResultHandler that turns bare command statuses into empty datasets
+        // (if the fetch returns no rows, we see just a CommandStatus..)
+        final ResultHandler delegateHandler = handler;
+        handler = new ResultHandler() {
+            public void handleResultRows(Query fromQuery, Field[] fields, List tuples, ResultCursor cursor) {
+                delegateHandler.handleResultRows(fromQuery, fields, tuples, cursor);
+            }
+
+            public void handleCommandStatus(String status, int updateCount, long insertOID) {
+                handleResultRows(getQuery(), null, new ArrayList(), null);
+            }
+
+            public void handleWarning(SQLWarning warning) {
+                delegateHandler.handleWarning(warning);
+            }
+
+            public void handleError(SQLException error) {
+                delegateHandler.handleError(error);
+            }
+
+            public void handleCompletion() throws SQLException{
+                delegateHandler.handleCompletion();
+            }
+        };
+
+        // Now actually run it.
+
+        QueryExecutorImpl v3QueryExecutor = (QueryExecutorImpl) queryExecutor;
+        v3QueryExecutor.fetchFromPortal(this, handler, fetchSize);
+
+        handler.handleCompletion();
+
     }
 
     String getPortalName() {

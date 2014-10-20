@@ -245,15 +245,15 @@ public class QueryExecutorImpl implements QueryExecutor {
 
         try
         {
-            QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges);
+            QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges, flags);
             try
             {
                 handler = sendQueryPreamble(queryRunner, handler, flags);
                 ErrorTrackingResultHandler trackingHandler = new ErrorTrackingResultHandler(handler);
                 queryCount = 0;
-                sendQuery(queryRunner, (V3Query)query, (V3ParameterList)parameters, maxRows, fetchSize, flags, trackingHandler);
+                queryRunner = sendQuery(queryRunner, (V3Query)query, (V3ParameterList)parameters, maxRows, fetchSize, flags, trackingHandler);
                 sendSync();
-                queryRunner.processResults(handler, flags);
+                queryRunner.processResults(handler, fetchSize);
             }
             catch (PGBindException se)
             {
@@ -272,7 +272,7 @@ public class QueryExecutorImpl implements QueryExecutor {
                 // transaction in progress?
                 //
                 sendSync();
-                queryRunner.processResults(handler, flags);
+                queryRunner.processResults(handler, fetchSize);
                 handler.handleError(new PSQLException(GT.tr("Unable to bind parameter values for statement."), PSQLState.INVALID_PARAMETER_VALUE, se.getIOException()));
             }
         }
@@ -387,7 +387,7 @@ public class QueryExecutorImpl implements QueryExecutor {
 
         try
         {
-            QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges);
+            QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges, flags);
             handler = sendQueryPreamble(queryRunner, handler, flags);
             ErrorTrackingResultHandler trackingHandler = new ErrorTrackingResultHandler(handler);
             queryCount = 0;
@@ -399,7 +399,7 @@ public class QueryExecutorImpl implements QueryExecutor {
                 if (parameters == null)
                     parameters = SimpleQuery.NO_PARAMETERS;
 
-                sendQuery(queryRunner, query, parameters, maxRows, fetchSize, flags, trackingHandler);
+                queryRunner = sendQuery(queryRunner, query, parameters, maxRows, fetchSize, flags, trackingHandler);
 
                 if (trackingHandler.hasErrors())
                     break;
@@ -408,7 +408,7 @@ public class QueryExecutorImpl implements QueryExecutor {
             if (!trackingHandler.hasErrors())
             {
                 sendSync();
-                queryRunner.processResults(handler, flags);
+                queryRunner.processResults(handler, fetchSize);
             }
         }
         catch (IOException e)
@@ -552,7 +552,7 @@ public class QueryExecutorImpl implements QueryExecutor {
 
             try
             {
-                QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges);
+                QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges, 0);
                 sendOneQuery(queryRunner, beginTransactionQuery, SimpleQuery.NO_PARAMETERS, 0, 0, QueryExecutor.QUERY_NO_METADATA);
                 sendSync();
                 queryRunner.processResults(handler, 0);
@@ -1122,7 +1122,7 @@ public class QueryExecutorImpl implements QueryExecutor {
     /*
      * Send a query to the backend.
      */
-    private void sendQuery(QueryRunner queryRunner, V3Query query, V3ParameterList parameters, int maxRows, int fetchSize, int flags, ErrorTrackingResultHandler trackingHandler) throws IOException, SQLException {
+    private QueryRunner sendQuery(QueryRunner queryRunner, V3Query query, V3ParameterList parameters, int maxRows, int fetchSize, int flags, ErrorTrackingResultHandler trackingHandler) throws IOException, SQLException {
         // Now the query itself.
         SimpleQuery[] subqueries = query.getSubqueries();
         SimpleParameterList[] subparams = parameters.getSubparams();
@@ -1134,9 +1134,10 @@ public class QueryExecutorImpl implements QueryExecutor {
             if (disallowBatching || queryCount >= MAX_BUFFERED_QUERIES)
             {
                 sendSync();
-                queryRunner.processResults(trackingHandler, flags);
+                queryRunner.processResults(trackingHandler, fetchSize);
 
                 queryCount = 0;
+                queryRunner = queryRunner.getRunnerForNextQuery();
             }
 
              // If we saw errors, don't send anything more.
@@ -1151,7 +1152,8 @@ public class QueryExecutorImpl implements QueryExecutor {
                 if (disallowBatching || queryCount >= MAX_BUFFERED_QUERIES)
                 {
                     sendSync();
-                    queryRunner.processResults(trackingHandler, flags);
+                    queryRunner.processResults(trackingHandler, fetchSize);
+                    queryRunner = queryRunner.getRunnerForNextQuery();
 
                     // If we saw errors, don't send anything more.
                     if (trackingHandler.hasErrors())
@@ -1174,6 +1176,7 @@ public class QueryExecutorImpl implements QueryExecutor {
                 sendOneQuery(queryRunner, subqueries[i], subparam, maxRows, fetchSize, flags);
             }
         }
+        return queryRunner;
     }
 
     //
@@ -1420,41 +1423,16 @@ public class QueryExecutorImpl implements QueryExecutor {
     public synchronized void fetch(ResultCursor cursor, ResultHandler handler, int fetchSize)
     throws SQLException {
         waitOnLock();
-        final Portal portal = (Portal)cursor;
+        ((FetchableResultCursor)cursor).fetch(this, handler, fetchSize);
+    }
 
-        // Insert a ResultHandler that turns bare command statuses into empty datasets
-        // (if the fetch returns no rows, we see just a CommandStatus..)
-        final ResultHandler delegateHandler = handler;
-        handler = new ResultHandler() {
-                      public void handleResultRows(Query fromQuery, Field[] fields, List tuples, ResultCursor cursor) {
-                          delegateHandler.handleResultRows(fromQuery, fields, tuples, cursor);
-                      }
-
-                      public void handleCommandStatus(String status, int updateCount, long insertOID) {
-                          handleResultRows(portal.getQuery(), null, new ArrayList(), null);
-                      }
-
-                      public void handleWarning(SQLWarning warning) {
-                          delegateHandler.handleWarning(warning);
-                      }
-
-                      public void handleError(SQLException error) {
-                          delegateHandler.handleError(error);
-                      }
-
-                      public void handleCompletion() throws SQLException{
-                          delegateHandler.handleCompletion();
-                      }
-                  };
-
-        // Now actually run it.
-
+    void fetchFromPortal(Portal portal, ResultHandler handler, int fetchSize) {
         try
         {
             processDeadParsedQueries();
             processDeadPortals();
 
-            QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges);
+            QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges, 0);
             queryRunner.sendExecute(portal.getQuery(), portal, fetchSize);
             sendSync();
 
@@ -1465,8 +1443,6 @@ public class QueryExecutorImpl implements QueryExecutor {
             protoConnection.close();
             handler.handleError(new PSQLException(GT.tr("An I/O error occurred while sending to the backend."), PSQLState.CONNECTION_FAILURE, e));
         }
-
-        handler.handleCompletion();
     }
 
     /*

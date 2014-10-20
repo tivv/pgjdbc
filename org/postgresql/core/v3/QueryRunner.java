@@ -9,36 +9,47 @@
 package org.postgresql.core.v3;
 
 import org.postgresql.core.*;
+import org.postgresql.test.util.TmpFileInputStream;
 import org.postgresql.util.GT;
 import org.postgresql.util.PSQLException;
 import org.postgresql.util.PSQLState;
 
-import java.io.IOException;
+import java.io.*;
 import java.sql.SQLException;
 import java.sql.SQLWarning;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 
-public class QueryRunner {
+public class QueryRunner implements FetchableResultCursor {
     private final QueryExecutorImpl queryExecutor;
     private final ProtocolConnectionImpl protoConnection;
     private final Logger logger;
-    private final PGStream pgStream;
     private final boolean allowEncodingChanges;
+    private final int flags;
+    private PGStream pgStream;
 
     private final ArrayList pendingParseQueue = new ArrayList(); // list of SimpleQuery instances
     private final ArrayList pendingBindQueue = new ArrayList(); // list of Portal instances
     private final ArrayList pendingExecuteQueue = new ArrayList(); // list of {SimpleQuery,Portal} object arrays
     private final ArrayList pendingDescribeStatementQueue = new ArrayList(); // list of {SimpleQuery, SimpleParameterList, Boolean} object arrays
     private final ArrayList pendingDescribePortalQueue = new ArrayList(); // list of SimpleQuery
+    private InputStream swappedData;
 
-    public QueryRunner(QueryExecutorImpl queryExecutor, ProtocolConnectionImpl protoConnection, PGStream pgStream, Logger logger, boolean allowEncodingChanges) {
+    int parseIndex = 0;
+    int describeIndex = 0;
+    int describePortalIndex = 0;
+    int bindIndex = 0;
+    int executeIndex = 0;
+
+    public QueryRunner(QueryExecutorImpl queryExecutor, ProtocolConnectionImpl protoConnection, PGStream pgStream,
+                       Logger logger, boolean allowEncodingChanges, int flags) {
         this.queryExecutor = queryExecutor;
         this.protoConnection = protoConnection;
         this.pgStream = pgStream;
         this.logger = logger;
         this.allowEncodingChanges = allowEncodingChanges;
+        this.flags = flags;
     }
 
     void sendParse(SimpleQuery query, SimpleParameterList params, boolean oneShot) throws IOException {
@@ -354,7 +365,7 @@ public class QueryRunner {
         pendingExecuteQueue.add(new Object[] { query, portal });
     }
 
-    protected void processResults(ResultHandler handler, int flags) throws IOException {
+    protected void processResults(ResultHandler handler, int swapLimit) throws IOException {
         boolean noResults = (flags & QueryExecutor.QUERY_NO_RESULTS) != 0;
         boolean bothRowsAndStatus = (flags & QueryExecutor.QUERY_BOTH_ROWS_AND_STATUS) != 0;
 
@@ -370,12 +381,6 @@ public class QueryRunner {
         // look for the next RowDescription or NoData message and return
         // from there.
         boolean doneAfterRowDescNoData = false;
-
-        int parseIndex = 0;
-        int describeIndex = 0;
-        int describePortalIndex = 0;
-        int bindIndex = 0;
-        int executeIndex = 0;
 
         while (!endQuery)
         {
@@ -562,6 +567,24 @@ public class QueryRunner {
                     logger.debug(" <=BE DataRow(len=" + length + ")");
                 }
 
+                if (swapLimit > 0 && tuples.size() > swapLimit) {
+                    if (swappedData == null)
+                    {
+                        if (logger.logDebug())
+                            logger.debug("Already received " + tuples.size() + " tuples that is over " + swapLimit +
+                            " limit. Swapping remained to tmp file");
+                        swappedData = swapToFile(handler);
+                        pgStream = new PGStream(pgStream.getHostSpec(), swappedData, pgStream.getEncoding());
+                    }
+
+                    Object[] executeData = (Object[])pendingExecuteQueue.get(executeIndex);
+                    SimpleQuery currentQuery = (SimpleQuery)executeData[0];
+
+                    handler.handleResultRows(currentQuery, currentQuery.getFields(), tuples, this);
+                    tuples = null;
+                    endQuery = true;
+                }
+
                 break;
 
             case 'E':  // Error Response (response to pretty much everything; backend then skips until Sync)
@@ -594,41 +617,7 @@ public class QueryRunner {
                 break;
 
             case 'S':    // Parameter Status
-                {
-                    int l_len = pgStream.ReceiveInteger4();
-                    String name = pgStream.ReceiveString();
-                    String value = pgStream.ReceiveString();
-                    if (logger.logDebug())
-                        logger.debug(" <=BE ParameterStatus(" + name + " = " + value + ")");
-
-                    if (name.equals("client_encoding") && !value.equalsIgnoreCase("UTF8") && !allowEncodingChanges)
-                    {
-                        protoConnection.close(); // we're screwed now; we can't trust any subsequent string.
-                        handler.handleError(new PSQLException(GT.tr("The server''s client_encoding parameter was changed to {0}. The JDBC driver requires client_encoding to be UTF8 for correct operation.", value), PSQLState.CONNECTION_FAILURE));
-                        endQuery = true;
-                    }
-
-                    if (name.equals("DateStyle") && !value.startsWith("ISO,"))
-                    {
-                        protoConnection.close(); // we're screwed now; we can't trust any subsequent date.
-                        handler.handleError(new PSQLException(GT.tr("The server''s DateStyle parameter was changed to {0}. The JDBC driver requires DateStyle to begin with ISO for correct operation.", value), PSQLState.CONNECTION_FAILURE));
-                        endQuery = true;
-                    }
-                    
-                    if (name.equals("standard_conforming_strings"))
-                    {
-                        if (value.equals("on"))
-                            protoConnection.setStandardConformingStrings(true);
-                        else if (value.equals("off"))
-                            protoConnection.setStandardConformingStrings(false);
-                        else
-                        {
-                            protoConnection.close(); // we're screwed now; we don't know how to escape string literals
-                            handler.handleError(new PSQLException(GT.tr("The server''s standard_conforming_strings parameter was reported as {0}. The JDBC driver expected on or off.", value), PSQLState.CONNECTION_FAILURE));
-                            endQuery = true;
-                        }
-                    }
-                }
+                endQuery = processParameterStatus(handler, endQuery);
                 break;
 
             case 'T':  // Row Description (response to Describe)
@@ -668,23 +657,7 @@ public class QueryRunner {
                 break;
 
             case 'G':  // CopyInResponse
-                if (logger.logDebug()) {
-                    logger.debug(" <=BE CopyInResponse");
-                    logger.debug(" FE=> CopyFail");
-                }
-
-                // COPY sub-protocol is not implemented yet
-                // We'll send a CopyFail message for COPY FROM STDIN so that
-                // server does not wait for the data.
-
-                byte[] buf = Utils.encodeUTF8("The JDBC driver currently does not support COPY operations.");
-                pgStream.SendChar('f');
-                pgStream.SendInteger4(buf.length + 4 + 1);
-                pgStream.Send(buf);
-                pgStream.SendChar(0);
-                pgStream.flush();
-                queryExecutor.sendSync();     // send sync message
-                queryExecutor.skipMessage();  // skip the response message
+                processCopyInResponse();
                 break;
 
             case 'H':  // CopyOutResponse
@@ -718,6 +691,135 @@ public class QueryRunner {
         }
     }
 
+    private boolean processParameterStatus(ResultHandler handler, boolean endQuery) throws IOException {
+        int l_len = pgStream.ReceiveInteger4();
+        String name = pgStream.ReceiveString();
+        String value = pgStream.ReceiveString();
+        if (logger.logDebug())
+            logger.debug(" <=BE ParameterStatus(" + name + " = " + value + ")");
+
+        if (name.equals("client_encoding") && !value.equalsIgnoreCase("UTF8") && !allowEncodingChanges)
+        {
+            protoConnection.close(); // we're screwed now; we can't trust any subsequent string.
+            handler.handleError(new PSQLException(GT.tr("The server''s client_encoding parameter was changed to {0}. The JDBC driver requires client_encoding to be UTF8 for correct operation.", value), PSQLState.CONNECTION_FAILURE));
+            endQuery = true;
+        }
+
+        if (name.equals("DateStyle") && !value.startsWith("ISO,"))
+        {
+            protoConnection.close(); // we're screwed now; we can't trust any subsequent date.
+            handler.handleError(new PSQLException(GT.tr("The server''s DateStyle parameter was changed to {0}. The JDBC driver requires DateStyle to begin with ISO for correct operation.", value), PSQLState.CONNECTION_FAILURE));
+            endQuery = true;
+        }
+
+        if (name.equals("standard_conforming_strings"))
+        {
+            if (value.equals("on"))
+                protoConnection.setStandardConformingStrings(true);
+            else if (value.equals("off"))
+                protoConnection.setStandardConformingStrings(false);
+            else
+            {
+                protoConnection.close(); // we're screwed now; we don't know how to escape string literals
+                handler.handleError(new PSQLException(GT.tr("The server''s standard_conforming_strings parameter was reported as {0}. The JDBC driver expected on or off.", value), PSQLState.CONNECTION_FAILURE));
+                endQuery = true;
+            }
+        }
+        return endQuery;
+    }
+
+    private void processCopyInResponse() throws IOException {
+        if (logger.logDebug()) {
+            logger.debug(" <=BE CopyInResponse");
+            logger.debug(" FE=> CopyFail");
+        }
+
+        // COPY sub-protocol is not implemented yet
+        // We'll send a CopyFail message for COPY FROM STDIN so that
+        // server does not wait for the data.
+
+        byte[] buf = Utils.encodeUTF8("The JDBC driver currently does not support COPY operations.");
+        pgStream.SendChar('f');
+        pgStream.SendInteger4(buf.length + 4 + 1);
+        pgStream.Send(buf);
+        pgStream.SendChar(0);
+        pgStream.flush();
+        queryExecutor.sendSync();     // send sync message
+        queryExecutor.skipMessage();  // skip the response message
+    }
+
+    private InputStream swapToFile(ResultHandler handler) throws IOException {
+        File tmpFile = File.createTempFile("pgjdbc", ".bin");
+        OutputStream out = new BufferedOutputStream(new FileOutputStream(tmpFile));
+        try
+        {
+            boolean endQuery = false;
+            while (!endQuery)
+            {
+                int c = pgStream.ReceiveChar();
+                switch (c)
+                {
+                    case 'A':  // Asynchronous Notify
+                        queryExecutor.receiveAsyncNotify();
+                        break;
+                    case 'Z':    // Ready For Query (eventual response to Sync)
+                        endQuery = true;
+                    case '1':    // Parse Complete (response to Parse)
+                    case 't':    // ParameterDescription
+                    case '2':    // Bind Complete  (response to Bind)
+                    case '3':    // Close Complete (response to Close)
+                    case 'n':    // No Data        (response to Describe)
+                    case 's':    // Portal Suspended (end of Execute)
+                    case 'C':  // Command Status (end of Execute)
+                    case 'D':  // Data Transfer (ongoing Execute response)
+                    case 'E':  // Error Response (response to pretty much everything; backend then skips until Sync)
+                    case 'I':  // Empty Query (end of Execute)
+                    case 'N':  // Notice Response
+                    case 'T':  // Row Description (response to Describe)
+                    case 'H':  // CopyOutResponse
+                        if (logger.logDebug())
+                            logger.debug(" <=BE " + ((char) c));
+                        out.write(c);
+                        int l_len = pgStream.ReceiveAndCopyInteger4(out);
+                        // copy l_len-4 (length includes the 4 bytes for message length itself
+                        pgStream.CopyTo(out, l_len - 4);
+
+                        break;
+
+                    case 'S':    // Parameter Status
+                        endQuery = processParameterStatus(handler, endQuery);
+                        break;
+
+                    case 'G':  // CopyInResponse
+                        processCopyInResponse();
+                        break;
+
+                    case 'c':  // CopyDone
+                    case 'd':  // CopyData
+                        queryExecutor.skipMessage();
+                        if (logger.logDebug())
+                            logger.debug(" <=BE " + ((char) c));
+                        break;
+
+                    default:
+                        throw new IOException("Unexpected packet type: " + c);
+                }
+            }
+            out.close();
+        } catch (IOException e) {
+            try {
+                out.close();
+                tmpFile.delete();
+            } finally
+            {
+                throw e;
+            }
+        }
+        if (logger.logDebug())
+            logger.debug("Swapped " + tmpFile.length() + " bytes to " + tmpFile);
+        return new TmpFileInputStream(tmpFile);
+    }
+
     private void interpretCommandStatus(String status, ResultHandler handler) {
         int update_count = 0;
         long insert_oid = 0;
@@ -748,4 +850,36 @@ public class QueryRunner {
         handler.handleCommandStatus(status, update_count, insert_oid);
     }
 
+    @Override
+    public void fetch(QueryExecutor queryExecutor, ResultHandler handler, int fetchSize) throws SQLException {
+        try
+        {
+            processResults(handler, fetchSize);
+        }
+        catch (IOException e)
+        {
+            protoConnection.close();
+            handler.handleError(new PSQLException(GT.tr("An I/O error occurred while sending to the backend."), PSQLState.CONNECTION_FAILURE, e));
+        }
+    }
+
+    @Override
+    public void close() {
+        if (swappedData != null) {
+            try
+            {
+                swappedData.close();
+            } catch (IOException e)
+            {
+                if (logger.logInfo())
+                {
+                    logger.log("Error closing swap stream", e);
+                }
+            }
+        }
+    }
+
+    public QueryRunner getRunnerForNextQuery() {
+        return new QueryRunner(queryExecutor, protoConnection, pgStream, logger, allowEncodingChanges, flags);
+    }
 }

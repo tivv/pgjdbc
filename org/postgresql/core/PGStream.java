@@ -78,6 +78,27 @@ public class PGStream
       this(hostSpec, 0);
     }
 
+    /**
+     * Constructor:  Creates read-only PGStream able to read from a replay stream provided
+     *
+     * @param hostSpec the host and port of the original PGStream
+     * @param replayStream the replayStream to read from
+     * @exception IOException if an IOException occurs below it.
+     */
+    public PGStream(HostSpec hostSpec, InputStream replayStream, Encoding encoding) throws IOException
+    {
+        this.hostSpec = hostSpec;
+        this.connection = null;
+        pg_input = new VisibleBufferedInputStream(replayStream, 8192);
+        pg_output = null;
+
+        if (encoding != null)
+            setEncoding(encoding);
+
+        _int2buf = new byte[2];
+        _int4buf = new byte[4];
+    }
+
     public HostSpec getHostSpec() {
         return hostSpec;
     }
@@ -300,6 +321,22 @@ public class PGStream
     }
 
     /**
+     * Receives a four byte integer from the backend and writes it to another stream
+     *
+     * @param copyTo stream to copy the integer to
+     * @return the integer received from the backend
+     * @exception IOException if an I/O error occurs
+     */
+    public int ReceiveAndCopyInteger4(OutputStream copyTo) throws IOException
+    {
+        if (pg_input.read(_int4buf) != 4)
+            throw new EOFException();
+
+        copyTo.write(_int4buf);
+        return (_int4buf[0] & 0xFF) << 24 | (_int4buf[1] & 0xFF) << 16 | (_int4buf[2] & 0xFF) << 8 | _int4buf[3] & 0xFF;
+    }
+
+    /**
      * Receives a two byte integer from the backend
      *
      * @return the integer received from the backend
@@ -476,6 +513,24 @@ public class PGStream
         long s = 0;
         while (s < size) {
             s += pg_input.skip(size - s);
+        }
+    }
+
+    /**
+     * Copy given number of bytes to the OutputStream
+     * @param copyTo stream to copy bytes to
+     * @param size how many bytes to copy
+     * @throws IOException if a data I/O error occurs
+     * @throws EOFException if end of stream reached
+     */
+    public void CopyTo(OutputStream copyTo, int size) throws IOException {
+        long s = 0;
+        while (s < size) {
+            int copied = pg_input.copyTo(copyTo, size);
+            if (copied < 0) {
+                throw new EOFException();
+            }
+            s += copied;
         }
     }
 
