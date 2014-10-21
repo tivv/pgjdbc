@@ -28,6 +28,7 @@ public class QueryRunner implements FetchableResultCursor {
     private final boolean allowEncodingChanges;
     private final int flags;
     private PGStream pgStream;
+    private ProtocolHelper protocolHelper;
 
     private final ArrayList pendingParseQueue = new ArrayList(); // list of SimpleQuery instances
     private final ArrayList pendingBindQueue = new ArrayList(); // list of Portal instances
@@ -47,6 +48,7 @@ public class QueryRunner implements FetchableResultCursor {
         this.queryExecutor = queryExecutor;
         this.protoConnection = protoConnection;
         this.pgStream = pgStream;
+        this.protocolHelper = new ProtocolHelper(logger, pgStream, protoConnection);
         this.logger = logger;
         this.allowEncodingChanges = allowEncodingChanges;
         this.flags = flags;
@@ -388,7 +390,7 @@ public class QueryRunner implements FetchableResultCursor {
             switch (c)
             {
             case 'A':  // Asynchronous Notify
-                queryExecutor.receiveAsyncNotify();
+                protocolHelper.receiveAsyncNotify();
                 break;
 
             case '1':    // Parse Complete (response to Parse)
@@ -504,7 +506,7 @@ public class QueryRunner implements FetchableResultCursor {
 
             case 'C':  // Command Status (end of Execute)
                 // Handle status.
-                String status = queryExecutor.receiveCommandStatus();
+                String status = protocolHelper.receiveCommandStatus();
 
                 doneAfterRowDescNoData = false;
 
@@ -575,6 +577,7 @@ public class QueryRunner implements FetchableResultCursor {
                             " limit. Swapping remained to tmp file");
                         swappedData = swapToFile(handler);
                         pgStream = new PGStream(pgStream.getHostSpec(), swappedData, pgStream.getEncoding());
+                        protocolHelper = new ProtocolHelper(logger, pgStream, protoConnection);
                     }
 
                     Object[] executeData = (Object[])pendingExecuteQueue.get(executeIndex);
@@ -588,7 +591,7 @@ public class QueryRunner implements FetchableResultCursor {
                 break;
 
             case 'E':  // Error Response (response to pretty much everything; backend then skips until Sync)
-                SQLException error = queryExecutor.receiveErrorResponse();
+                SQLException error = protocolHelper.receiveErrorResponse();
                 handler.handleError(error);
 
                 // keep processing
@@ -612,7 +615,7 @@ public class QueryRunner implements FetchableResultCursor {
                 break;
 
             case 'N':  // Notice Response
-                SQLWarning warning = queryExecutor.receiveNoticeResponse();
+                SQLWarning warning = protocolHelper.receiveNoticeResponse();
                 handler.handleWarning(warning);
                 break;
 
@@ -621,7 +624,7 @@ public class QueryRunner implements FetchableResultCursor {
                 break;
 
             case 'T':  // Row Description (response to Describe)
-                Field[] fields = queryExecutor.receiveFields();
+                Field[] fields = protocolHelper.receiveFields();
                 tuples = new ArrayList();
 
                 SimpleQuery query = (SimpleQuery)pendingDescribePortalQueue.get(describePortalIndex++);
@@ -638,7 +641,7 @@ public class QueryRunner implements FetchableResultCursor {
                 break;
 
             case 'Z':    // Ready For Query (eventual response to Sync)
-                queryExecutor.receiveRFQ();
+                protocolHelper.receiveRFQ();
                 endQuery = true;
 
                 // Reset the statement name of Parses that failed.
@@ -664,21 +667,21 @@ public class QueryRunner implements FetchableResultCursor {
                 if (logger.logDebug())
                     logger.debug(" <=BE CopyOutResponse");
  
-                queryExecutor.skipMessage();
+                protocolHelper.skipMessage();
                 // In case of CopyOutResponse, we cannot abort data transfer,
                 // so just throw an error and ignore CopyData messages
                 handler.handleError(new PSQLException(GT.tr("The driver currently does not support COPY operations."), PSQLState.NOT_IMPLEMENTED));
                 break;
 
             case 'c':  // CopyDone
-                queryExecutor.skipMessage();
+                protocolHelper.skipMessage();
                 if (logger.logDebug()) {
                     logger.debug(" <=BE CopyDone");
                 }
                 break;
 
             case 'd':  // CopyData
-                queryExecutor.skipMessage();
+                protocolHelper.skipMessage();
                 if (logger.logDebug()) {
                     logger.debug(" <=BE CopyData");
                 }
@@ -744,8 +747,8 @@ public class QueryRunner implements FetchableResultCursor {
         pgStream.Send(buf);
         pgStream.SendChar(0);
         pgStream.flush();
-        queryExecutor.sendSync();     // send sync message
-        queryExecutor.skipMessage();  // skip the response message
+        protocolHelper.sendSync();     // send sync message
+        protocolHelper.skipMessage();  // skip the response message
     }
 
     private InputStream swapToFile(ResultHandler handler) throws IOException {
@@ -760,7 +763,7 @@ public class QueryRunner implements FetchableResultCursor {
                 switch (c)
                 {
                     case 'A':  // Asynchronous Notify
-                        queryExecutor.receiveAsyncNotify();
+                        protocolHelper.receiveAsyncNotify();
                         break;
                     case 'Z':    // Ready For Query (eventual response to Sync)
                         endQuery = true;
@@ -796,7 +799,7 @@ public class QueryRunner implements FetchableResultCursor {
 
                     case 'c':  // CopyDone
                     case 'd':  // CopyData
-                        queryExecutor.skipMessage();
+                        protocolHelper.skipMessage();
                         if (logger.logDebug())
                             logger.debug(" <=BE " + ((char) c));
                         break;

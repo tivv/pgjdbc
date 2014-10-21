@@ -20,9 +20,7 @@ import java.lang.ref.*;
 import java.io.IOException;
 import java.sql.*;
 import org.postgresql.util.PSQLException;
-import org.postgresql.util.PSQLWarning;
 import org.postgresql.util.PSQLState;
-import org.postgresql.util.ServerErrorMessage;
 import org.postgresql.util.GT;
 import org.postgresql.copy.CopyOperation;
 
@@ -34,6 +32,7 @@ public class QueryExecutorImpl implements QueryExecutor {
         this.protoConnection = protoConnection;
         this.pgStream = pgStream;
         this.logger = logger;
+        this.protocolHelper = new ProtocolHelper(logger, pgStream, protoConnection);
 
         if (info.getProperty("allowEncodingChanges") != null) {
             this.allowEncodingChanges = Boolean.parseBoolean(info.getProperty("allowEncodingChanges"));
@@ -252,7 +251,7 @@ public class QueryExecutorImpl implements QueryExecutor {
                 ErrorTrackingResultHandler trackingHandler = new ErrorTrackingResultHandler(handler);
                 queryCount = 0;
                 queryRunner = sendQuery(queryRunner, (V3Query)query, (V3ParameterList)parameters, maxRows, fetchSize, flags, trackingHandler);
-                sendSync();
+                protocolHelper.sendSync();
                 queryRunner.processResults(handler, fetchSize);
             }
             catch (PGBindException se)
@@ -271,7 +270,7 @@ public class QueryExecutorImpl implements QueryExecutor {
                 // caller to rollback if there is a
                 // transaction in progress?
                 //
-                sendSync();
+                protocolHelper.sendSync();
                 queryRunner.processResults(handler, fetchSize);
                 handler.handleError(new PSQLException(GT.tr("Unable to bind parameter values for statement."), PSQLState.INVALID_PARAMETER_VALUE, se.getIOException()));
             }
@@ -407,7 +406,7 @@ public class QueryExecutorImpl implements QueryExecutor {
 
             if (!trackingHandler.hasErrors())
             {
-                sendSync();
+                protocolHelper.sendSync();
                 queryRunner.processResults(handler, fetchSize);
             }
         }
@@ -554,7 +553,7 @@ public class QueryExecutorImpl implements QueryExecutor {
             {
                 QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges, 0);
                 sendOneQuery(queryRunner, beginTransactionQuery, SimpleQuery.NO_PARAMETERS, 0, 0, QueryExecutor.QUERY_NO_METADATA);
-                sendSync();
+                protocolHelper.sendSync();
                 queryRunner.processResults(handler, 0);
             }
             catch (IOException ioe)
@@ -625,13 +624,13 @@ public class QueryExecutorImpl implements QueryExecutor {
                 int c = pgStream.ReceiveChar();
                 switch (c) {
                 case 'A':  // Asynchronous Notify
-                    receiveAsyncNotify();
+                    protocolHelper.receiveAsyncNotify();
                     break;
                 case 'E':  // Error Response (response to pretty much everything; backend then skips until Sync)
-                    throw receiveErrorResponse();
+                    throw protocolHelper.receiveErrorResponse();
                     // break;
                 case 'N':  // Notice Response (warnings / info)
-                    SQLWarning warning = receiveNoticeResponse();
+                    SQLWarning warning = protocolHelper.receiveNoticeResponse();
                     protoConnection.addWarning(warning);
                     break;
                 default:
@@ -654,11 +653,11 @@ public class QueryExecutorImpl implements QueryExecutor {
             switch (c)
             {
             case 'A':  // Asynchronous Notify
-                receiveAsyncNotify();
+                protocolHelper.receiveAsyncNotify();
                 break;
 
             case 'E':  // Error Response (response to pretty much everything; backend then skips until Sync)
-                SQLException newError = receiveErrorResponse();
+                SQLException newError = protocolHelper.receiveErrorResponse();
                 if (error == null)
                     error = newError;
                 else
@@ -667,12 +666,12 @@ public class QueryExecutorImpl implements QueryExecutor {
                 break;
 
             case 'N':  // Notice Response (warnings / info)
-                SQLWarning warning = receiveNoticeResponse();
+                SQLWarning warning = protocolHelper.receiveNoticeResponse();
                 protoConnection.addWarning(warning);
                 break;
 
             case 'Z':    // Ready For Query (eventual response to Sync)
-                receiveRFQ();
+                protocolHelper.receiveRFQ();
                 endQuery = true;
                 break;
 
@@ -942,7 +941,7 @@ public class QueryExecutorImpl implements QueryExecutor {
                 if (logger.logDebug())
                     logger.debug(" <=BE Asynchronous Notification while copying");
 
-                receiveAsyncNotify();
+                protocolHelper.receiveAsyncNotify();
                 break;
 
             case 'N': // Notice Response
@@ -950,12 +949,12 @@ public class QueryExecutorImpl implements QueryExecutor {
                 if (logger.logDebug())
                     logger.debug(" <=BE Notification while copying");
 
-                protoConnection.addWarning(receiveNoticeResponse());
+                protoConnection.addWarning(protocolHelper.receiveNoticeResponse());
                 break;
 
             case 'C': // Command Complete
 
-                String status = receiveCommandStatus();
+                String status = protocolHelper.receiveCommandStatus();
 
                 try {
                     if(op == null)
@@ -970,7 +969,7 @@ public class QueryExecutorImpl implements QueryExecutor {
 
             case 'E': // ErrorMessage (expected response to CopyFail)
 
-                error = receiveErrorResponse();
+                error = protocolHelper.receiveErrorResponse();
                 // We've received the error and we now expect to receive
                 // Ready for query, but we must block because it might still be
                 // on the wire and not here yet.
@@ -1076,7 +1075,7 @@ public class QueryExecutorImpl implements QueryExecutor {
 
             case 'Z': // ReadyForQuery: After FE:CopyDone => BE:CommandComplete
 
-                receiveRFQ();
+                protocolHelper.receiveRFQ();
                 if(hasLock(op))
                     unlock(op);
                 op = null;
@@ -1090,14 +1089,14 @@ public class QueryExecutorImpl implements QueryExecutor {
                     logger.debug(" <=BE RowDescription (during copy ignored)");
 
 
-                skipMessage();
+                protocolHelper.skipMessage();
                 break;
 
             case 'D':  // DataRow
                 if (logger.logDebug())
                     logger.debug(" <=BE DataRow (during copy ignored)");
 
-                skipMessage();
+                protocolHelper.skipMessage();
                 break;
 
             default:
@@ -1133,7 +1132,7 @@ public class QueryExecutorImpl implements QueryExecutor {
             ++queryCount;
             if (disallowBatching || queryCount >= MAX_BUFFERED_QUERIES)
             {
-                sendSync();
+                protocolHelper.sendSync();
                 queryRunner.processResults(trackingHandler, fetchSize);
 
                 queryCount = 0;
@@ -1151,7 +1150,7 @@ public class QueryExecutorImpl implements QueryExecutor {
                 ++queryCount;
                 if (disallowBatching || queryCount >= MAX_BUFFERED_QUERIES)
                 {
-                    sendSync();
+                    protocolHelper.sendSync();
                     queryRunner.processResults(trackingHandler, fetchSize);
                     queryRunner = queryRunner.getRunnerForNextQuery();
 
@@ -1182,15 +1181,6 @@ public class QueryExecutorImpl implements QueryExecutor {
     //
     // Message sending
     //
-
-    void sendSync() throws IOException {
-        if (logger.logDebug())
-            logger.debug(" FE=> Sync");
-
-        pgStream.SendChar('S');     // Sync
-        pgStream.SendInteger4(4); // Length
-        pgStream.flush();
-    }
 
     private void sendClosePortal(String portalName) throws IOException {
         //
@@ -1410,16 +1400,6 @@ public class QueryExecutorImpl implements QueryExecutor {
         }
     }
 
-    /**
-     * Ignore the response message by reading the message length and skipping
-     * over those bytes in the communication stream.
-     */
-    void skipMessage() throws IOException {
-        int l_len = pgStream.ReceiveInteger4();        
-        // skip l_len-4 (length includes the 4 bytes for message length itself
-        pgStream.Skip(l_len - 4);
-    }
- 
     public synchronized void fetch(ResultCursor cursor, ResultHandler handler, int fetchSize)
     throws SQLException {
         waitOnLock();
@@ -1434,7 +1414,7 @@ public class QueryExecutorImpl implements QueryExecutor {
 
             QueryRunner queryRunner = new QueryRunner(this, protoConnection, pgStream, logger, allowEncodingChanges, 0);
             queryRunner.sendExecute(portal.getQuery(), portal, fetchSize);
-            sendSync();
+            protocolHelper.sendSync();
 
             queryRunner.processResults(handler, 0);
         }
@@ -1445,118 +1425,10 @@ public class QueryExecutorImpl implements QueryExecutor {
         }
     }
 
-    /*
-     * Receive the field descriptions from the back end.
-     */
-    Field[] receiveFields() throws IOException
-    {
-        int l_msgSize = pgStream.ReceiveInteger4();
-        int size = pgStream.ReceiveInteger2();
-        Field[] fields = new Field[size];
-
-        if (logger.logDebug())
-            logger.debug(" <=BE RowDescription(" + size + ")");
-
-        for (int i = 0; i < fields.length; i++)
-        {
-            String columnLabel = pgStream.ReceiveString();
-            int tableOid = pgStream.ReceiveInteger4();
-            short positionInTable = (short)pgStream.ReceiveInteger2();
-            int typeOid = pgStream.ReceiveInteger4();
-            int typeLength = pgStream.ReceiveInteger2();
-            int typeModifier = pgStream.ReceiveInteger4();
-            int formatType = pgStream.ReceiveInteger2();
-            fields[i] = new Field(columnLabel,
-                                  "",  /* name not yet determined */
-                                  typeOid, typeLength, typeModifier, tableOid, positionInTable);
-            fields[i].setFormat(formatType);
-
-            if (logger.logDebug())
-                logger.debug("        " + fields[i]);
-        }
-
-        return fields;
-    }
-
-    void receiveAsyncNotify() throws IOException {
-        int msglen = pgStream.ReceiveInteger4();
-        int pid = pgStream.ReceiveInteger4();
-        String msg = pgStream.ReceiveString();
-        String param = pgStream.ReceiveString();
-        protoConnection.addNotification(new org.postgresql.core.Notification(msg, pid, param));
-
-        if (logger.logDebug())
-            logger.debug(" <=BE AsyncNotify(" + pid + "," + msg + "," + param + ")");
-    }
-
-    SQLException receiveErrorResponse() throws IOException {
-        // it's possible to get more than one error message for a query
-        // see libpq comments wrt backend closing a connection
-        // so, append messages to a string buffer and keep processing
-        // check at the bottom to see if we need to throw an exception
-
-        int elen = pgStream.ReceiveInteger4();
-        String totalMessage = pgStream.ReceiveString(elen - 4);
-        ServerErrorMessage errorMsg = new ServerErrorMessage(totalMessage, logger.getLogLevel());
-
-        if (logger.logDebug())
-            logger.debug(" <=BE ErrorMessage(" + errorMsg.toString() + ")");
-
-        return new PSQLException(errorMsg);
-    }
-
-    SQLWarning receiveNoticeResponse() throws IOException {
-        int nlen = pgStream.ReceiveInteger4();
-        ServerErrorMessage warnMsg = new ServerErrorMessage(pgStream.ReceiveString(nlen - 4), logger.getLogLevel());
-
-        if (logger.logDebug())
-            logger.debug(" <=BE NoticeResponse(" + warnMsg.toString() + ")");
-
-        return new PSQLWarning(warnMsg);
-    }
-
-    String receiveCommandStatus() throws IOException {
-        //TODO: better handle the msg len
-        int l_len = pgStream.ReceiveInteger4();
-        //read l_len -5 bytes (-4 for l_len and -1 for trailing \0)
-        String status = pgStream.ReceiveString(l_len - 5);
-        //now read and discard the trailing \0
-        pgStream.Receive(1);
-
-        if (logger.logDebug())
-            logger.debug(" <=BE CommandStatus(" + status + ")");
-
-        return status;
-    }
-
-    void receiveRFQ() throws IOException {
-        if (pgStream.ReceiveInteger4() != 5)
-            throw new IOException("unexpected length of ReadyForQuery message");
-
-        char tStatus = (char)pgStream.ReceiveChar();
-        if (logger.logDebug())
-            logger.debug(" <=BE ReadyForQuery(" + tStatus + ")");
-
-        // Update connection state.
-        switch (tStatus)
-        {
-        case 'I':
-            protoConnection.setTransactionState(ProtocolConnection.TRANSACTION_IDLE);
-            break;
-        case 'T':
-            protoConnection.setTransactionState(ProtocolConnection.TRANSACTION_OPEN);
-            break;
-        case 'E':
-            protoConnection.setTransactionState(ProtocolConnection.TRANSACTION_FAILED);
-            break;
-        default:
-            throw new IOException("unexpected transaction state in ReadyForQuery message: " + (int)tStatus);
-        }
-    }
-
     private long nextUniqueID = 1;
     private final ProtocolConnectionImpl protoConnection;
     private final PGStream pgStream;
+    private final ProtocolHelper protocolHelper;
     private final Logger logger;
     private final boolean allowEncodingChanges;
 
