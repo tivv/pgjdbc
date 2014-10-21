@@ -161,17 +161,21 @@ public class PGStream
 
         this.encoding = encoding;
 
-        // Intercept flush() downcalls from the writer; our caller
-        // will call PGStream.flush() as needed.
-        OutputStream interceptor = new FilterOutputStream(pg_output) {
-                                       public void flush() throws IOException {
-                                       }
-                                       public void close() throws IOException {
-                                           super.flush();
-                                       }
-                                   };
+        if (pg_output != null)
+        {
+            // Intercept flush() downcalls from the writer; our caller
+            // will call PGStream.flush() as needed.
+            OutputStream interceptor = new FilterOutputStream(pg_output) {
+                public void flush() throws IOException {
+                }
 
-        encodingWriter = encoding.getEncodingWriter(interceptor);
+                public void close() throws IOException {
+                    super.flush();
+                }
+            };
+
+            encodingWriter = encoding.getEncodingWriter(interceptor);
+        }
     }
 
     /**
@@ -608,8 +612,12 @@ public class PGStream
         if (encodingWriter != null)
             encodingWriter.close();
 
-        pg_output.close();
+        if (pg_output != null)
+            pg_output.close();
+
         pg_input.close();
-        connection.close();
+
+        if (connection != null)
+            connection.close();
     }
 }

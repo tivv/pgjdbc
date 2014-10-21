@@ -377,6 +377,7 @@ public class QueryRunner implements FetchableResultCursor {
         int len;
         int c;
         boolean endQuery = false;
+        boolean finishedReading = true;
 
         // At the end of a command execution we have the CommandComplete
         // message to tell us we're done, but with a describeOnly command
@@ -385,316 +386,339 @@ public class QueryRunner implements FetchableResultCursor {
         // from there.
         boolean doneAfterRowDescNoData = false;
 
-        while (!endQuery)
+        try
         {
-            c = pgStream.ReceiveChar();
-            switch (c)
+            while (!endQuery)
             {
-            case 'A':  // Asynchronous Notify
-                protocolHelper.receiveAsyncNotify();
-                break;
-
-            case '1':    // Parse Complete (response to Parse)
-                pgStream.ReceiveInteger4(); // len, discarded
-
-                Object[] parsedQueryAndStatement = (Object[])pendingParseQueue.get(parseIndex++);
-
-                SimpleQuery parsedQuery = (SimpleQuery)parsedQueryAndStatement[0];
-                String parsedStatementName = (String)parsedQueryAndStatement[1];
-
-                if (logger.logDebug())
-                    logger.debug(" <=BE ParseComplete [" + parsedStatementName + "]");
-
-                queryExecutor.registerParsedQuery(parsedQuery, parsedStatementName);
-                break;
-
-            case 't':    // ParameterDescription
-                pgStream.ReceiveInteger4(); // len, discarded
-
-                if (logger.logDebug())
-                    logger.debug(" <=BE ParameterDescription");
-
+                c = pgStream.ReceiveChar();
+                switch (c)
                 {
-                    Object describeData[] = (Object[])pendingDescribeStatementQueue.get(describeIndex);
-                    SimpleQuery query = (SimpleQuery)describeData[0];
-                    SimpleParameterList params = (SimpleParameterList)describeData[1];
-                    boolean describeOnly = ((Boolean)describeData[2]).booleanValue();
-                    String origStatementName = (String)describeData[3];
+                    case 'A':  // Asynchronous Notify
+                        protocolHelper.receiveAsyncNotify();
+                        break;
 
-                    int numParams = pgStream.ReceiveInteger2();
+                    case '1':    // Parse Complete (response to Parse)
+                        pgStream.ReceiveInteger4(); // len, discarded
 
-                    for (int i=1; i<=numParams; i++) {
-                        int typeOid = pgStream.ReceiveInteger4();
-                        params.setResolvedType(i, typeOid);
-                    }
+                        Object[] parsedQueryAndStatement = (Object[]) pendingParseQueue.get(parseIndex++);
 
-                    // Since we can issue multiple Parse and DescribeStatement
-                    // messages in a single network trip, we need to make
-                    // sure the describe results we requested are still
-                    // applicable to the latest parsed query.
-                    //
-                    if ((origStatementName == null && query.getStatementName() == null) || (origStatementName != null && origStatementName.equals(query.getStatementName()))) {
-                        query.setStatementTypes((int[])params.getTypeOIDs().clone());
-                    }
+                        SimpleQuery parsedQuery = (SimpleQuery) parsedQueryAndStatement[0];
+                        String parsedStatementName = (String) parsedQueryAndStatement[1];
 
-                    if (describeOnly)
-                        doneAfterRowDescNoData = true;
-                    else
-                        describeIndex++;
-                }
-                break;
+                        if (logger.logDebug())
+                            logger.debug(" <=BE ParseComplete [" + parsedStatementName + "]");
 
-            case '2':    // Bind Complete  (response to Bind)
-                pgStream.ReceiveInteger4(); // len, discarded
+                        queryExecutor.registerParsedQuery(parsedQuery, parsedStatementName);
+                        break;
 
-                Portal boundPortal = (Portal)pendingBindQueue.get(bindIndex++);
-                if (logger.logDebug())
-                    logger.debug(" <=BE BindComplete [" + boundPortal + "]");
+                    case 't':    // ParameterDescription
+                        pgStream.ReceiveInteger4(); // len, discarded
 
-                queryExecutor.registerOpenPortal(boundPortal);
-                break;
+                        if (logger.logDebug())
+                            logger.debug(" <=BE ParameterDescription");
 
-            case '3':    // Close Complete (response to Close)
-                pgStream.ReceiveInteger4(); // len, discarded
-                if (logger.logDebug())
-                    logger.debug(" <=BE CloseComplete");
-                break;
-
-            case 'n':    // No Data        (response to Describe)
-                pgStream.ReceiveInteger4(); // len, discarded
-                if (logger.logDebug())
-                    logger.debug(" <=BE NoData");
-
-                describePortalIndex++;
-
-                if (doneAfterRowDescNoData) {
-                    Object describeData[] = (Object[])pendingDescribeStatementQueue.get(describeIndex++);
-                    SimpleQuery currentQuery = (SimpleQuery)describeData[0];
-
-                    Field[] fields = currentQuery.getFields();
-
-                    if (fields != null)
-                    { // There was a resultset.
-                        tuples = new ArrayList();
-                        handler.handleResultRows(currentQuery, fields, tuples, null);
-                        tuples = null;
-                    }
-                }
-                break;
-
-            case 's':    // Portal Suspended (end of Execute)
-                // nb: this appears *instead* of CommandStatus.
-                // Must be a SELECT if we suspended, so don't worry about it.
-
-                pgStream.ReceiveInteger4(); // len, discarded
-                if (logger.logDebug())
-                    logger.debug(" <=BE PortalSuspended");
-
-                {
-                    Object[] executeData = (Object[])pendingExecuteQueue.get(executeIndex++);
-                    SimpleQuery currentQuery = (SimpleQuery)executeData[0];
-                    Portal currentPortal = (Portal)executeData[1];
-
-                    Field[] fields = currentQuery.getFields();
-                    if (fields != null && !noResults && tuples == null)
-                        tuples = new ArrayList();
-
-                    handler.handleResultRows(currentQuery, fields, tuples, currentPortal);
-                }
-
-                tuples = null;
-                break;
-
-            case 'C':  // Command Status (end of Execute)
-                // Handle status.
-                String status = protocolHelper.receiveCommandStatus();
-
-                doneAfterRowDescNoData = false;
-
-                {
-                    Object[] executeData = (Object[])pendingExecuteQueue.get(executeIndex++);
-                    SimpleQuery currentQuery = (SimpleQuery)executeData[0];
-                    Portal currentPortal = (Portal)executeData[1];
-
-                    Field[] fields = currentQuery.getFields();
-                    if (fields != null && !noResults && tuples == null)
-                        tuples = new ArrayList();
-
-                    if (fields != null || tuples != null)
-                    { // There was a resultset.
-                        handler.handleResultRows(currentQuery, fields, tuples, null);
-                        tuples = null;
-
-                        if (bothRowsAndStatus)
-                            interpretCommandStatus(status, handler);
-                    }
-                    else
                     {
-                        interpretCommandStatus(status, handler);
-                    }
+                        Object describeData[] = (Object[]) pendingDescribeStatementQueue.get(describeIndex);
+                        SimpleQuery query = (SimpleQuery) describeData[0];
+                        SimpleParameterList params = (SimpleParameterList) describeData[1];
+                        boolean describeOnly = ((Boolean) describeData[2]).booleanValue();
+                        String origStatementName = (String) describeData[3];
 
-                    if (currentPortal != null)
-                        currentPortal.close();
-                }
-                break;
+                        int numParams = pgStream.ReceiveInteger2();
 
-            case 'D':  // Data Transfer (ongoing Execute response)
-                byte[][] tuple = null;
-                try {
-                    tuple = pgStream.ReceiveTupleV3();
-                } catch(OutOfMemoryError oome) {
-                    if (!noResults) {
-                        handler.handleError(new PSQLException(GT.tr("Ran out of memory retrieving query results."), PSQLState.OUT_OF_MEMORY, oome));
-                    }
-                }
-
-
-                if (!noResults)
-                {
-                    if (tuples == null)
-                        tuples = new ArrayList();
-                    tuples.add(tuple);
-                }
-
-                if (logger.logDebug()) {
-                    int length;
-                    if (tuple == null) {
-                        length = -1;
-                    } else {
-                        length = 0;
-                        for (int i=0; i< tuple.length; ++i) {
-                            if (tuple[i] == null) continue;
-                            length += tuple[i].length;
+                        for (int i = 1; i <= numParams; i++)
+                        {
+                            int typeOid = pgStream.ReceiveInteger4();
+                            params.setResolvedType(i, typeOid);
                         }
-                    }
-                    logger.debug(" <=BE DataRow(len=" + length + ")");
-                }
 
-                if (swappable && swapLimit > 0 && tuples.size() >= swapLimit) {
-                    if (swappedData == null)
+                        // Since we can issue multiple Parse and DescribeStatement
+                        // messages in a single network trip, we need to make
+                        // sure the describe results we requested are still
+                        // applicable to the latest parsed query.
+                        //
+                        if ((origStatementName == null && query.getStatementName() == null) || (origStatementName != null && origStatementName.equals(query.getStatementName())))
+                        {
+                            query.setStatementTypes((int[]) params.getTypeOIDs().clone());
+                        }
+
+                        if (describeOnly)
+                            doneAfterRowDescNoData = true;
+                        else
+                            describeIndex++;
+                    }
+                    break;
+
+                    case '2':    // Bind Complete  (response to Bind)
+                        pgStream.ReceiveInteger4(); // len, discarded
+
+                        Portal boundPortal = (Portal) pendingBindQueue.get(bindIndex++);
+                        if (logger.logDebug())
+                            logger.debug(" <=BE BindComplete [" + boundPortal + "]");
+
+                        queryExecutor.registerOpenPortal(boundPortal);
+                        break;
+
+                    case '3':    // Close Complete (response to Close)
+                        pgStream.ReceiveInteger4(); // len, discarded
+                        if (logger.logDebug())
+                            logger.debug(" <=BE CloseComplete");
+                        break;
+
+                    case 'n':    // No Data        (response to Describe)
+                        pgStream.ReceiveInteger4(); // len, discarded
+                        if (logger.logDebug())
+                            logger.debug(" <=BE NoData");
+
+                        describePortalIndex++;
+
+                        if (doneAfterRowDescNoData)
+                        {
+                            Object describeData[] = (Object[]) pendingDescribeStatementQueue.get(describeIndex++);
+                            SimpleQuery currentQuery = (SimpleQuery) describeData[0];
+
+                            Field[] fields = currentQuery.getFields();
+
+                            if (fields != null)
+                            { // There was a resultset.
+                                tuples = new ArrayList();
+                                handler.handleResultRows(currentQuery, fields, tuples, null);
+                                tuples = null;
+                            }
+                        }
+                        break;
+
+                    case 's':    // Portal Suspended (end of Execute)
+                        // nb: this appears *instead* of CommandStatus.
+                        // Must be a SELECT if we suspended, so don't worry about it.
+
+                        pgStream.ReceiveInteger4(); // len, discarded
+                        if (logger.logDebug())
+                            logger.debug(" <=BE PortalSuspended");
+
                     {
-                        if (logger.logDebug())
-                            logger.debug("Already received " + tuples.size() + " tuples that is over " + swapLimit +
-                            " limit. Swapping remained to tmp file");
-                        swappedData = swapToFile(handler);
-                        pgStream = new PGStream(pgStream.getHostSpec(), swappedData, pgStream.getEncoding());
-                        protocolHelper = new ProtocolHelper(logger, pgStream, protoConnection);
-                    } else {
-                        if (logger.logDebug())
-                            logger.debug("Already read " + tuples.size() + " from swap file. Returning the batch.");
+                        Object[] executeData = (Object[]) pendingExecuteQueue.get(executeIndex++);
+                        SimpleQuery currentQuery = (SimpleQuery) executeData[0];
+                        Portal currentPortal = (Portal) executeData[1];
+
+                        Field[] fields = currentQuery.getFields();
+                        if (fields != null && !noResults && tuples == null)
+                            tuples = new ArrayList();
+
+                        handler.handleResultRows(currentQuery, fields, tuples, currentPortal);
                     }
 
-                    Object[] executeData = (Object[])pendingExecuteQueue.get(executeIndex);
-                    SimpleQuery currentQuery = (SimpleQuery)executeData[0];
-
-                    handler.handleResultRows(currentQuery, currentQuery.getFields(), tuples, this);
                     tuples = null;
-                    endQuery = true;
+                    break;
+
+                    case 'C':  // Command Status (end of Execute)
+                        // Handle status.
+                        String status = protocolHelper.receiveCommandStatus();
+
+                        doneAfterRowDescNoData = false;
+
+                    {
+                        Object[] executeData = (Object[]) pendingExecuteQueue.get(executeIndex++);
+                        SimpleQuery currentQuery = (SimpleQuery) executeData[0];
+                        Portal currentPortal = (Portal) executeData[1];
+
+                        Field[] fields = currentQuery.getFields();
+                        if (fields != null && !noResults && tuples == null)
+                            tuples = new ArrayList();
+
+                        if (fields != null || tuples != null)
+                        { // There was a resultset.
+                            handler.handleResultRows(currentQuery, fields, tuples, null);
+                            tuples = null;
+
+                            if (bothRowsAndStatus)
+                                interpretCommandStatus(status, handler);
+                        } else
+                        {
+                            interpretCommandStatus(status, handler);
+                        }
+
+                        if (currentPortal != null)
+                            currentPortal.close();
+                    }
+                    break;
+
+                    case 'D':  // Data Transfer (ongoing Execute response)
+                        byte[][] tuple = null;
+                        try
+                        {
+                            tuple = pgStream.ReceiveTupleV3();
+                        } catch (OutOfMemoryError oome)
+                        {
+                            if (!noResults)
+                            {
+                                handler.handleError(new PSQLException(GT.tr("Ran out of memory retrieving query results."), PSQLState.OUT_OF_MEMORY, oome));
+                            }
+                        }
+
+
+                        if (!noResults)
+                        {
+                            if (tuples == null)
+                                tuples = new ArrayList();
+                            tuples.add(tuple);
+                        }
+
+                        if (logger.logDebug())
+                        {
+                            int length;
+                            if (tuple == null)
+                            {
+                                length = -1;
+                            } else
+                            {
+                                length = 0;
+                                for (int i = 0; i < tuple.length; ++i)
+                                {
+                                    if (tuple[i] == null) continue;
+                                    length += tuple[i].length;
+                                }
+                            }
+                            logger.debug(" <=BE DataRow(len=" + length + ")");
+                        }
+
+                        if (swappable && swapLimit > 0 && tuples.size() >= swapLimit)
+                        {
+                            if (swappedData == null)
+                            {
+                                if (logger.logDebug())
+                                    logger.debug("Already received " + tuples.size() + " tuples that is over " + swapLimit +
+                                            " limit. Swapping remained to tmp file");
+                                swappedData = swapToFile(handler);
+                                pgStream = new PGStream(pgStream.getHostSpec(), swappedData, pgStream.getEncoding());
+                                protocolHelper = new ProtocolHelper(logger, pgStream, protoConnection);
+                            } else
+                            {
+                                if (logger.logDebug())
+                                    logger.debug("Already read " + tuples.size() + " from swap file. Returning the batch.");
+                            }
+
+                            Object[] executeData = (Object[]) pendingExecuteQueue.get(executeIndex);
+                            SimpleQuery currentQuery = (SimpleQuery) executeData[0];
+
+                            handler.handleResultRows(currentQuery, currentQuery.getFields(), tuples, this);
+                            tuples = null;
+                            endQuery = true;
+                            finishedReading = false;
+                        }
+
+                        break;
+
+                    case 'E':  // Error Response (response to pretty much everything; backend then skips until Sync)
+                        SQLException error = protocolHelper.receiveErrorResponse();
+                        handler.handleError(error);
+
+                        // keep processing
+                        break;
+
+                    case 'I':  // Empty Query (end of Execute)
+                        pgStream.ReceiveInteger4();
+
+                        if (logger.logDebug())
+                            logger.debug(" <=BE EmptyQuery");
+
+                    {
+                        Object[] executeData = (Object[]) pendingExecuteQueue.get(executeIndex++);
+                        Query currentQuery = (Query) executeData[0];
+                        Portal currentPortal = (Portal) executeData[1];
+                        handler.handleCommandStatus("EMPTY", 0, 0);
+                        if (currentPortal != null)
+                            currentPortal.close();
+                    }
+
+                    break;
+
+                    case 'N':  // Notice Response
+                        SQLWarning warning = protocolHelper.receiveNoticeResponse();
+                        handler.handleWarning(warning);
+                        break;
+
+                    case 'S':    // Parameter Status
+                        endQuery = processParameterStatus(handler, endQuery);
+                        break;
+
+                    case 'T':  // Row Description (response to Describe)
+                        Field[] fields = protocolHelper.receiveFields();
+                        tuples = new ArrayList();
+
+                        SimpleQuery query = (SimpleQuery) pendingDescribePortalQueue.get(describePortalIndex++);
+                        query.setFields(fields);
+
+                        if (doneAfterRowDescNoData)
+                        {
+                            Object describeData[] = (Object[]) pendingDescribeStatementQueue.get(describeIndex++);
+                            SimpleQuery currentQuery = (SimpleQuery) describeData[0];
+                            currentQuery.setFields(fields);
+
+                            handler.handleResultRows(currentQuery, fields, tuples, null);
+                            tuples = null;
+                        }
+                        break;
+
+                    case 'Z':    // Ready For Query (eventual response to Sync)
+                        protocolHelper.receiveRFQ();
+                        endQuery = true;
+
+                        // Reset the statement name of Parses that failed.
+                        while (parseIndex < pendingParseQueue.size())
+                        {
+                            Object[] failedQueryAndStatement = (Object[]) pendingParseQueue.get(parseIndex++);
+                            SimpleQuery failedQuery = (SimpleQuery) failedQueryAndStatement[0];
+                            failedQuery.unprepare();
+                        }
+
+                        pendingParseQueue.clear();              // No more ParseComplete messages expected.
+                        pendingDescribeStatementQueue.clear();  // No more ParameterDescription messages expected.
+                        pendingDescribePortalQueue.clear();     // No more RowDescription messages expected.
+                        pendingBindQueue.clear();               // No more BindComplete messages expected.
+                        pendingExecuteQueue.clear();            // No more query executions expected.
+                        break;
+
+                    case 'G':  // CopyInResponse
+                        processCopyInResponse();
+                        break;
+
+                    case 'H':  // CopyOutResponse
+                        if (logger.logDebug())
+                            logger.debug(" <=BE CopyOutResponse");
+
+                        protocolHelper.skipMessage();
+                        // In case of CopyOutResponse, we cannot abort data transfer,
+                        // so just throw an error and ignore CopyData messages
+                        handler.handleError(new PSQLException(GT.tr("The driver currently does not support COPY operations."), PSQLState.NOT_IMPLEMENTED));
+                        break;
+
+                    case 'c':  // CopyDone
+                        protocolHelper.skipMessage();
+                        if (logger.logDebug())
+                        {
+                            logger.debug(" <=BE CopyDone");
+                        }
+                        break;
+
+                    case 'd':  // CopyData
+                        protocolHelper.skipMessage();
+                        if (logger.logDebug())
+                        {
+                            logger.debug(" <=BE CopyData");
+                        }
+                        break;
+
+                    default:
+                        throw new IOException("Unexpected packet type: " + c);
                 }
 
-                break;
-
-            case 'E':  // Error Response (response to pretty much everything; backend then skips until Sync)
-                SQLException error = protocolHelper.receiveErrorResponse();
-                handler.handleError(error);
-
-                // keep processing
-                break;
-
-            case 'I':  // Empty Query (end of Execute)
-                pgStream.ReceiveInteger4();
-
-                if (logger.logDebug())
-                    logger.debug(" <=BE EmptyQuery");
-
-                {
-                    Object[] executeData = (Object[])pendingExecuteQueue.get(executeIndex++);
-                    Query currentQuery = (Query)executeData[0];
-                    Portal currentPortal = (Portal)executeData[1];
-                    handler.handleCommandStatus("EMPTY", 0, 0);
-                    if (currentPortal != null)
-                        currentPortal.close();
-                }
-
-                break;
-
-            case 'N':  // Notice Response
-                SQLWarning warning = protocolHelper.receiveNoticeResponse();
-                handler.handleWarning(warning);
-                break;
-
-            case 'S':    // Parameter Status
-                endQuery = processParameterStatus(handler, endQuery);
-                break;
-
-            case 'T':  // Row Description (response to Describe)
-                Field[] fields = protocolHelper.receiveFields();
-                tuples = new ArrayList();
-
-                SimpleQuery query = (SimpleQuery)pendingDescribePortalQueue.get(describePortalIndex++);
-                query.setFields(fields);
-
-                if (doneAfterRowDescNoData) {
-                    Object describeData[] = (Object[])pendingDescribeStatementQueue.get(describeIndex++);
-                    SimpleQuery currentQuery = (SimpleQuery)describeData[0];
-                    currentQuery.setFields(fields);
-
-                    handler.handleResultRows(currentQuery, fields, tuples, null);
-                    tuples = null;
-                }
-                break;
-
-            case 'Z':    // Ready For Query (eventual response to Sync)
-                protocolHelper.receiveRFQ();
-                endQuery = true;
-
-                // Reset the statement name of Parses that failed.
-                while (parseIndex < pendingParseQueue.size())
-                {
-                    Object[] failedQueryAndStatement = (Object[])pendingParseQueue.get(parseIndex++);
-                    SimpleQuery failedQuery = (SimpleQuery)failedQueryAndStatement[0];
-                    failedQuery.unprepare();
-                }
-
-                pendingParseQueue.clear();              // No more ParseComplete messages expected.
-                pendingDescribeStatementQueue.clear();  // No more ParameterDescription messages expected.
-                pendingDescribePortalQueue.clear();     // No more RowDescription messages expected.
-                pendingBindQueue.clear();               // No more BindComplete messages expected.
-                pendingExecuteQueue.clear();            // No more query executions expected.
-                break;
-
-            case 'G':  // CopyInResponse
-                processCopyInResponse();
-                break;
-
-            case 'H':  // CopyOutResponse
-                if (logger.logDebug())
-                    logger.debug(" <=BE CopyOutResponse");
- 
-                protocolHelper.skipMessage();
-                // In case of CopyOutResponse, we cannot abort data transfer,
-                // so just throw an error and ignore CopyData messages
-                handler.handleError(new PSQLException(GT.tr("The driver currently does not support COPY operations."), PSQLState.NOT_IMPLEMENTED));
-                break;
-
-            case 'c':  // CopyDone
-                protocolHelper.skipMessage();
-                if (logger.logDebug()) {
-                    logger.debug(" <=BE CopyDone");
-                }
-                break;
-
-            case 'd':  // CopyData
-                protocolHelper.skipMessage();
-                if (logger.logDebug()) {
-                    logger.debug(" <=BE CopyData");
-                }
-                break;
-
-            default:
-                throw new IOException("Unexpected packet type: " + c);
             }
-
+        } finally
+        {
+            if (swappedData != null && finishedReading) {
+                pgStream.close();
+            }
         }
     }
 
