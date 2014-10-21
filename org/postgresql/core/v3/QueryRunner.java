@@ -370,6 +370,7 @@ public class QueryRunner implements FetchableResultCursor {
     protected void processResults(ResultHandler handler, int swapLimit) throws IOException {
         boolean noResults = (flags & QueryExecutor.QUERY_NO_RESULTS) != 0;
         boolean bothRowsAndStatus = (flags & QueryExecutor.QUERY_BOTH_ROWS_AND_STATUS) != 0;
+        boolean swappable = (flags & QueryExecutor.QUERY_SWAPPABLE) != 0;
 
         List tuples = null;
 
@@ -569,7 +570,7 @@ public class QueryRunner implements FetchableResultCursor {
                     logger.debug(" <=BE DataRow(len=" + length + ")");
                 }
 
-                if (swapLimit > 0 && tuples.size() > swapLimit) {
+                if (swappable && swapLimit > 0 && tuples.size() >= swapLimit) {
                     if (swappedData == null)
                     {
                         if (logger.logDebug())
@@ -578,6 +579,9 @@ public class QueryRunner implements FetchableResultCursor {
                         swappedData = swapToFile(handler);
                         pgStream = new PGStream(pgStream.getHostSpec(), swappedData, pgStream.getEncoding());
                         protocolHelper = new ProtocolHelper(logger, pgStream, protoConnection);
+                    } else {
+                        if (logger.logDebug())
+                            logger.debug("Already read " + tuples.size() + " from swap file. Returning the batch.");
                     }
 
                     Object[] executeData = (Object[])pendingExecuteQueue.get(executeIndex);

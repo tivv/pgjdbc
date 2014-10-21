@@ -101,6 +101,11 @@ public interface QueryExecutor {
     static int QUERY_NO_BINARY_TRANSFER = 256;
 
     /**
+     * Flag to indicate we want to swap results over fetchSize to file
+     */
+    static int QUERY_SWAPPABLE = 512;
+
+    /**
      * Execute a Query, passing results to a provided ResultHandler.
      *
      * @param query the query to execute; must be a query returned from
